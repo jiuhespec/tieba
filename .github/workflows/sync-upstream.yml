@@ -2,95 +2,147 @@ name: 自动同步上游仓库
 
 on:
   schedule:
-    # 每天凌晨2点执行（UTC时间，对应北京时间10点）
+    # 每天 UTC 2:00 执行，对应北京时间 10:00
     - cron: '0 2 * * *'
+
   # 允许手动触发
   workflow_dispatch:
 
-  # 允许 GITHUB_TOKEN 向当前仓库 push
+# 允许 GitHub Actions 向当前仓库推送代码
 permissions:
   contents: write
+
+# 防止多个同步任务同时运行，导致 push 冲突
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: true
 
 jobs:
   sync-upstream:
     runs-on: ubuntu-latest
     name: 同步上游仓库更新
-    
-    # 仅在Fork仓库中运行此工作流
+
+    # 仅在 Fork 仓库中运行此工作流
     if: github.repository != 'chiupam/tieba'
-    
+
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # 使用默认的GITHUB_TOKEN，它对当前仓库有写权限
           token: ${{ github.token }}
-      
-      - name: 配置Git
+
+      - name: 配置 Git
         run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-      
-      - name: 添加上游仓库
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: 获取当前仓库最新状态
         run: |
-          # 添加chiupam/tieba作为上游仓库
-          git remote add upstream https://github.com/chiupam/tieba.git
+          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+          echo "当前分支: $CURRENT_BRANCH"
+
+          git fetch origin "$CURRENT_BRANCH"
+
+          # 确保工作流基于当前 Fork 仓库最新版本运行
+          git reset --hard "origin/$CURRENT_BRANCH"
+
+          echo "✅ 已获取当前仓库最新状态"
+
+      - name: 添加并获取上游仓库
+        run: |
+          # 添加 chiupam/tieba 作为上游仓库
+          git remote add upstream https://github.com/chiupam/tieba.git || true
+
+          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+          git fetch upstream "$CURRENT_BRANCH"
+
+          echo "✅ 成功获取上游仓库最新代码"
           git remote -v
-      
-      - name: 获取上游更新
-        run: |
-          git fetch upstream
-          echo "✅ 成功获取上游仓库的最新代码"
-          
+
       - name: 备份需要保留的文件
         run: |
           if [ -f "last_activity.md" ]; then
-            echo "📦 备份本地的 last_activity.md 文件"
-            cp last_activity.md last_activity.md.backup
+            echo "📦 备份本地 last_activity.md"
+            cp last_activity.md /tmp/last_activity.md.backup
+          else
+            echo "ℹ️ 当前仓库不存在 last_activity.md，无需备份"
           fi
-      
+
       - name: 合并上游变更
         run: |
-          # 检查当前分支
           CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-          echo "当前分支: $CURRENT_BRANCH"
-          
-          # 执行合并
-          if git merge upstream/$CURRENT_BRANCH --no-edit; then
-            echo "✅ 已成功合并上游仓库的变更"
+
+          echo "正在合并 upstream/$CURRENT_BRANCH"
+
+          if git merge "upstream/$CURRENT_BRANCH" --no-edit; then
+            echo "✅ 已成功合并上游仓库变更"
           else
-            echo "⚠️ 合并过程中可能存在冲突，尝试使用策略解决..."
-            # 尝试使用theirs策略解决冲突（接受上游更改）
+            echo "⚠️ 普通合并出现冲突，尝试优先接受上游版本"
+
             git merge --abort
-            git merge upstream/$CURRENT_BRANCH -X theirs --no-edit
-            echo "⚠️ 使用theirs合并策略完成，如有异常请手动检查"
+
+            if git merge "upstream/$CURRENT_BRANCH" -X theirs --no-edit; then
+              echo "✅ 已使用 theirs 策略完成合并"
+            else
+              echo "❌ 自动解决冲突失败，需要手动处理"
+              exit 1
+            fi
           fi
-          
+
       - name: 恢复需要保留的文件
         run: |
-          if [ -f "last_activity.md.backup" ]; then
-            echo "📦 恢复本地的 last_activity.md 文件"
-            mv last_activity.md.backup last_activity.md
+          if [ -f "/tmp/last_activity.md.backup" ]; then
+            echo "📦 恢复本地 last_activity.md"
+
+            cp /tmp/last_activity.md.backup last_activity.md
+
             git add last_activity.md
-            git commit -m "保留本地 last_activity.md 文件" || echo "没有需要提交的更改"
+
+            if ! git diff --cached --quiet; then
+              git commit -m "保留本地 last_activity.md 文件"
+              echo "✅ 已恢复并提交 last_activity.md"
+            else
+              echo "ℹ️ last_activity.md 没有发生变化"
+            fi
           fi
-      
+
       - name: 推送更新
         run: |
-          # 推送到当前分支
           CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-          
-          # 只推送到Fork的仓库，不尝试推送到上游仓库
-          if git push origin $CURRENT_BRANCH; then
+
+          echo "准备推送到 origin/$CURRENT_BRANCH"
+
+          # 再获取一次远程状态
+          # 防止工作流运行期间仓库产生新的提交
+          git fetch origin "$CURRENT_BRANCH"
+
+          # 如果远程分支出现了新的提交，则先合并
+          if ! git merge-base --is-ancestor "origin/$CURRENT_BRANCH" HEAD; then
+            echo "⚠️ 检测到远程仓库在同步过程中出现新提交"
+            echo "正在合并远程最新提交..."
+
+            if git merge "origin/$CURRENT_BRANCH" --no-edit; then
+              echo "✅ 已合并远程最新提交"
+            else
+              echo "❌ 合并远程最新提交时发生冲突"
+              exit 1
+            fi
+          fi
+
+          # 推送到 Fork 仓库
+          if git push origin "$CURRENT_BRANCH"; then
             echo "✅ 已将更新推送到您的仓库"
           else
-            echo "❌ 推送失败，可能需要手动检查"
+            echo "❌ 推送失败，请检查仓库状态"
             exit 1
           fi
-      
+
       - name: 同步完成
         run: |
           echo "🎉 您的仓库已与上游仓库同步完成！"
+          echo ""
           echo "📝 最新提交信息："
-          git log -1 --pretty=format:"%h - %an: %s" 
+          git log -1 --pretty=format:"%h - %an: %s"
