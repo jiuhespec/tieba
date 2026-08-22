@@ -7,6 +7,10 @@ on:
   # 允许手动触发
   workflow_dispatch:
 
+  # 允许 GITHUB_TOKEN 向当前仓库 push
+permissions:
+  contents: write
+
 jobs:
   sync-upstream:
     runs-on: ubuntu-latest
