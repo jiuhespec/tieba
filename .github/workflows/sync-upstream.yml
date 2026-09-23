@@ -12,7 +12,7 @@ on:
 permissions:
   contents: write
 
-# 防止多个同步任务同时运行，导致 push 冲突
+# 防止多个同步任务同时运行
 concurrency:
   group: sync-upstream
   cancel-in-progress: true
@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     name: 同步上游仓库更新
 
-    # 仅在 Fork 仓库中运行此工作流
+    # 仅在 Fork 仓库中运行
     if: github.repository != 'chiupam/tieba'
 
     steps:
@@ -34,8 +34,8 @@ jobs:
 
       - name: 配置 Git
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: 获取当前仓库最新状态
         run: |
@@ -44,105 +44,100 @@ jobs:
           echo "当前分支: $CURRENT_BRANCH"
 
           git fetch origin "$CURRENT_BRANCH"
-
-          # 确保工作流基于当前 Fork 仓库最新版本运行
           git reset --hard "origin/$CURRENT_BRANCH"
 
-          echo "✅ 已获取当前仓库最新状态"
+          echo "✅ 已获取 Fork 仓库最新状态"
 
-      - name: 添加并获取上游仓库
+      - name: 获取上游仓库
         run: |
-          # 添加 chiupam/tieba 作为上游仓库
-          git remote add upstream https://github.com/chiupam/tieba.git || true
-
           CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 
+          git remote add upstream https://github.com/chiupam/tieba.git || true
           git fetch upstream "$CURRENT_BRANCH"
 
-          echo "✅ 成功获取上游仓库最新代码"
-          git remote -v
+          echo "✅ 已获取 upstream/$CURRENT_BRANCH"
 
-      - name: 备份需要保留的文件
-        run: |
-          if [ -f "last_activity.md" ]; then
-            echo "📦 备份本地 last_activity.md"
-            cp last_activity.md /tmp/last_activity.md.backup
-          else
-            echo "ℹ️ 当前仓库不存在 last_activity.md，无需备份"
-          fi
-
-      - name: 合并上游变更
+      - name: 同步上游代码
         run: |
           CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 
-          echo "正在合并 upstream/$CURRENT_BRANCH"
+          echo "开始同步 upstream/$CURRENT_BRANCH"
+          echo "以下内容不会从上游同步："
+          echo "  .github/workflows/"
+          echo "  .github/last_activity.md"
 
-          if git merge "upstream/$CURRENT_BRANCH" --no-edit; then
-            echo "✅ 已成功合并上游仓库变更"
+          # 生成 Fork 当前版本与上游版本之间的差异
+          # 排除本地 GitHub Actions 和 keep-alive 活动文件
+          git diff --binary HEAD "upstream/$CURRENT_BRANCH" -- \
+            . \
+            ':(exclude).github/workflows/**' \
+            ':(exclude).github/last_activity.md' \
+            > /tmp/upstream.patch
+
+          # 如果没有需要同步的变化，则直接结束
+          if [ ! -s /tmp/upstream.patch ]; then
+            echo "✅ 普通代码已经与上游一致，无需同步"
+            exit 0
+          fi
+
+          # 应用上游变更
+          if git apply --index --3way /tmp/upstream.patch; then
+            echo "✅ 已应用上游代码更新"
           else
-            echo "⚠️ 普通合并出现冲突，尝试优先接受上游版本"
-
-            git merge --abort
-
-            if git merge "upstream/$CURRENT_BRANCH" -X theirs --no-edit; then
-              echo "✅ 已使用 theirs 策略完成合并"
-            else
-              echo "❌ 自动解决冲突失败，需要手动处理"
-              exit 1
-            fi
+            echo "❌ 上游代码自动同步失败，请检查冲突"
+            exit 1
           fi
 
-      - name: 恢复需要保留的文件
+          echo ""
+          echo "本次准备同步的文件："
+          git status --short
+
+      - name: 检查工作流是否被修改
         run: |
-          if [ -f "/tmp/last_activity.md.backup" ]; then
-            echo "📦 恢复本地 last_activity.md"
-
-            cp /tmp/last_activity.md.backup last_activity.md
-
-            git add last_activity.md
-
-            if ! git diff --cached --quiet; then
-              git commit -m "保留本地 last_activity.md 文件"
-              echo "✅ 已恢复并提交 last_activity.md"
-            else
-              echo "ℹ️ last_activity.md 没有发生变化"
-            fi
+          # 安全检查：
+          # 理论上这里不应该出现 .github/workflows 的变化
+          if ! git diff --cached --quiet -- .github/workflows; then
+            echo "❌ 检测到 GitHub Actions 工作流被修改"
+            echo "为防止再次触发 Workflows 权限错误，停止同步"
+            exit 1
           fi
+
+          echo "✅ GitHub Actions 工作流保持不变"
+
+      - name: 提交同步结果
+        run: |
+          if git diff --cached --quiet; then
+            echo "✅ 没有需要提交的更新"
+            exit 0
+          fi
+
+          git commit -m "同步上游仓库更新"
+
+          echo "✅ 已创建同步提交"
 
       - name: 推送更新
         run: |
           CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 
-          echo "准备推送到 origin/$CURRENT_BRANCH"
-
-          # 再获取一次远程状态
-          # 防止工作流运行期间仓库产生新的提交
+          # 再次获取远程状态，降低并发修改导致 push 失败的概率
           git fetch origin "$CURRENT_BRANCH"
 
-          # 如果远程分支出现了新的提交，则先合并
           if ! git merge-base --is-ancestor "origin/$CURRENT_BRANCH" HEAD; then
-            echo "⚠️ 检测到远程仓库在同步过程中出现新提交"
-            echo "正在合并远程最新提交..."
-
-            if git merge "origin/$CURRENT_BRANCH" --no-edit; then
-              echo "✅ 已合并远程最新提交"
-            else
-              echo "❌ 合并远程最新提交时发生冲突"
-              exit 1
-            fi
+            echo "⚠️ 同步期间 Fork 仓库产生了新的提交"
+            echo "为避免覆盖这些修改，本次停止推送"
+            exit 1
           fi
 
-          # 推送到 Fork 仓库
           if git push origin "$CURRENT_BRANCH"; then
-            echo "✅ 已将更新推送到您的仓库"
+            echo "✅ 已将上游更新同步到 Fork 仓库"
           else
-            echo "❌ 推送失败，请检查仓库状态"
+            echo "❌ 推送失败"
             exit 1
           fi
 
       - name: 同步完成
         run: |
-          echo "🎉 您的仓库已与上游仓库同步完成！"
+          echo "🎉 仓库同步完成"
           echo ""
-          echo "📝 最新提交信息："
+          echo "📝 当前最新提交："
           git log -1 --pretty=format:"%h - %an: %s"
